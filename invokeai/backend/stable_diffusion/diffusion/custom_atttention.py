@@ -8,7 +8,120 @@ from diffusers.models.attention_processor import Attention, AttnProcessor2_0
 from invokeai.backend.ip_adapter.ip_attention_weights import IPAttentionProcessorWeights
 from invokeai.backend.stable_diffusion.diffusion.regional_ip_data import RegionalIPData
 from invokeai.backend.stable_diffusion.diffusion.regional_prompt_data import RegionalPromptData
+from invokeai.backend.util.logging import InvokeAILogger # Import the logger
 
+import os
+
+# Get a logger instance for this module
+logger = InvokeAILogger.get_logger(__name__)
+
+def detailed_tensor_diagnostics(name, tensor):
+    """Log detailed diagnostic information about a tensor at DEBUG level."""
+    logger.debug(f"\n=== {name} ===")
+    logger.debug(f"Shape: {tensor.shape}")
+    logger.debug(f"Dtype: {tensor.dtype}")
+    logger.debug(f"Device: {tensor.device}")
+    logger.debug(f"Contiguous: {tensor.is_contiguous()}")
+    logger.debug(f"Requires grad: {tensor.requires_grad}")
+    logger.debug(f"Storage offset: {tensor.storage_offset()}")
+    logger.debug(f"Stride: {tensor.stride()}")
+    
+    # Check for NaNs or extreme values
+    if tensor.dtype.is_floating_point:
+        logger.debug(f"Contains NaN: {torch.isnan(tensor).any().item()}")
+        logger.debug(f"Min value: {tensor.min().item()}")
+        logger.debug(f"Max value: {tensor.max().item()}")
+    
+    # Add a hash of the first few values to check content
+    sample = tensor.flatten()[:10].cpu().tolist()
+    logger.debug(f"First 10 values sample: {sample}")
+
+def chunked_scaled_dot_product_attention(query, key, value, attn_mask=None, dropout_p=0.0, 
+                                         is_causal=False, chunk_size_override: Optional[int] = None):
+    """Process attention in chunks to avoid Pytorch MPS backend errors with large sequence lengths.
+
+    See https://github.com/pytorch/pytorch/pull/149268 for details.
+
+    If running on MPS, automatically estimates an optimal chunk size based on memory constraints.
+    The `chunk_size_override` parameter can be used to force a specific chunk size, but this is
+    generally not recommended on MPS unless you know the optimal value for your hardware.
+    """
+    batch_size, num_heads, seq_len, head_dim = query.shape
+    key_len = key.shape[2]
+    
+    # Determine chunk size
+    if query.device.type == 'mps':
+        if chunk_size_override is not None:
+            chunk_size = chunk_size_override
+        else:
+            # Estimate chunk size based on available memory (heuristic)
+            chunk_size = estimate_optimal_chunk_size(
+                batch_size, num_heads, seq_len, key_len, head_dim, query.dtype
+            )
+    else:
+        # For non-MPS devices, use a large default or the override if provided
+        chunk_size = chunk_size_override if chunk_size_override is not None else seq_len
+
+    # Skip chunking if sequence length is already small enough
+    if seq_len <= chunk_size:
+        logger.info(f"[Chunking Skipped] seq_len {seq_len} <= chunk_size {chunk_size}") # Removed commented print
+        return F.scaled_dot_product_attention(
+            query, key, value, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=is_causal
+        )
+
+    # Process in chunks
+    logger.info(f"[Chunking Active] Processing seq_len {seq_len} in chunks of {chunk_size}") # Replaced print with logger.debug
+    chunks = []
+    for chunk_start in range(0, seq_len, chunk_size):
+        chunk_end = min(chunk_start + chunk_size, seq_len)
+        query_chunk = query[:, :, chunk_start:chunk_end, :]
+        # Properly chunk the attention mask if needed
+        chunk_attn_mask = attn_mask
+        if attn_mask is not None and attn_mask.shape[2] != 1:
+            chunk_attn_mask = attn_mask[:, :, chunk_start:chunk_end, :]
+        chunk_output = F.scaled_dot_product_attention(
+            query_chunk, key, value, attn_mask=chunk_attn_mask, 
+            dropout_p=dropout_p, is_causal=is_causal
+        )
+        chunks.append(chunk_output)
+    return torch.cat(chunks, dim=2)
+
+def estimate_optimal_chunk_size(batch_size, num_heads, seq_len, key_len, head_dim, dtype, max_mem_bytes=8*1024*1024):
+    """
+    Estimate the largest chunk size for attention that fits within max_mem_bytes.
+    Considers the largest intermediate tensor: attention scores [batch, heads, chunk_size, key_len].
+
+    Args:
+        batch_size: Batch size of the input tensors.
+        num_heads: Number of attention heads.
+        seq_len: Sequence length of the query tensor.
+        key_len: Sequence length of the key/value tensors.
+        head_dim: Dimension of each attention head.
+        dtype: Data type of the tensors (e.g., torch.float16).
+        max_mem_bytes: Maximum estimated memory (in bytes) allowed for the intermediate
+                       attention score tensor per chunk. Defaults to 8MB (8*1024*1024 bytes),
+                       a very conservative value chosen for maximum stability on MPS devices,
+                       especially those with limited VRAM. This may significantly reduce chunk
+                       size and potentially impact performance. This is a heuristic and might be
+                       adjusted based on specific hardware or observed behavior.
+    Returns:
+        An estimated optimal chunk size (integer).
+    """
+    dtype_size = torch.tensor([], dtype=dtype).element_size()
+    # Avoid division by zero
+    if batch_size == 0 or num_heads == 0 or key_len == 0:
+        return 1
+    # chunk_size = max_mem_bytes // (batch * heads * key_len * dtype_size)
+    max_chunk = max_mem_bytes // (batch_size * num_heads * key_len * dtype_size)
+    
+    # Clamp to at least 1 and at most seq_len
+    chunk_size = max(1, min(seq_len, int(max_chunk)))
+    
+    # Align down to the nearest multiple of 8 for potential performance benefit
+    aligned_chunk_size = (chunk_size // 8) * 8
+    
+    # Ensure the aligned size is at least 1 (or maybe 8?)
+    return max(1, aligned_chunk_size)
 
 @dataclass
 class IPAdapterAttentionWeights:
@@ -123,12 +236,36 @@ class CustomAttnProcessor2_0(AttnProcessor2_0):
 
         key = key.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
         value = value.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
-
+        # ---------------------
+        logger.debug("\n----- DIAGNOSTICS FOR APPLICATION ENVIRONMENT -----")
+        detailed_tensor_diagnostics("query", query)
+        detailed_tensor_diagnostics("key", key)
+        detailed_tensor_diagnostics("value", value)
+        if attention_mask is not None:
+            detailed_tensor_diagnostics("attention_mask", attention_mask)
+    
+        # Save tensors for testing
+        tensors = {
+            "query": query.detach().cpu(),
+            "key": key.detach().cpu(),
+            "value": value.detach().cpu(),
+            "attention_mask": attention_mask.detach().cpu() if attention_mask is not None else None
+        }
+    
+        os.makedirs(os.path.join(os.getcwd(), 'tests'), exist_ok=True)
+        torch.save(tensors, os.path.join(os.getcwd(), 'tests', 'problematic_tensors.pt'))
+        logger.debug(f"Saved tensors to {os.path.join(os.getcwd(), 'tests', 'problematic_tensors.pt')}")
+        
+        # ---------------------
         # the output of sdp = (batch, num_heads, seq_len, head_dim)
         # TODO: add support for attn.scale when we move to Torch 2.1
-        hidden_states = F.scaled_dot_product_attention(
-            query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False
+        hidden_states = chunked_scaled_dot_product_attention(
+            query, key, value, attn_mask=attention_mask, 
+            dropout_p=0.0, is_causal=False
         )
+        # hidden_states = F.scaled_dot_product_attention(
+        #     query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False
+        # )
 
         hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, attn.heads * head_dim)
         hidden_states = hidden_states.to(query.dtype)
