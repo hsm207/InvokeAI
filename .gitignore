@@ -190,3 +190,4 @@ installer/update.bat
 installer/update.sh
 installer/InvokeAI-Installer/
 .aider*
+invokeai_root/
