@@ -192,3 +192,4 @@ installer/InvokeAI-Installer/
 .aider*
 
 .claude/
+invokeai_root/
