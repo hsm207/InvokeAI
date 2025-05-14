@@ -86,10 +86,15 @@ def chunked_scaled_dot_product_attention(query, key, value, attn_mask=None, drop
         chunks.append(chunk_output)
     return torch.cat(chunks, dim=2)
 
-def estimate_optimal_chunk_size(batch_size, num_heads, seq_len, key_len, head_dim, dtype, max_mem_bytes=8*1024*1024):
+def estimate_optimal_chunk_size(
+    batch_size, num_heads, seq_len, key_len, head_dim, dtype, max_mem_bytes=8*1024*1024
+):
     """
     Estimate the largest chunk size for attention that fits within max_mem_bytes.
-    Considers the largest intermediate tensor: attention scores [batch, heads, chunk_size, key_len].
+    Considers the largest intermediate tensors:
+      - attention scores [batch, heads, chunk_size, key_len]
+      - softmax output [batch, heads, chunk_size, key_len]
+      - output [batch, heads, chunk_size, head_dim]
 
     Args:
         batch_size: Batch size of the input tensors.
@@ -98,29 +103,31 @@ def estimate_optimal_chunk_size(batch_size, num_heads, seq_len, key_len, head_di
         key_len: Sequence length of the key/value tensors.
         head_dim: Dimension of each attention head.
         dtype: Data type of the tensors (e.g., torch.float16).
-        max_mem_bytes: Maximum estimated memory (in bytes) allowed for the intermediate
-                       attention score tensor per chunk. Defaults to 8MB (8*1024*1024 bytes),
-                       a very conservative value chosen for maximum stability on MPS devices,
-                       especially those with limited VRAM. This may significantly reduce chunk
-                       size and potentially impact performance. This is a heuristic and might be
-                       adjusted based on specific hardware or observed behavior.
+        max_mem_bytes: Maximum estimated memory (in bytes) allowed for the sum of
+                       the largest intermediate tensors per chunk. Defaults to 8MB.
     Returns:
         An estimated optimal chunk size (integer).
     """
     dtype_size = torch.tensor([], dtype=dtype).element_size()
-    # Avoid division by zero
-    if batch_size == 0 or num_heads == 0 or key_len == 0:
+    if batch_size == 0 or num_heads == 0 or key_len == 0 or head_dim == 0:
         return 1
-    # chunk_size = max_mem_bytes // (batch * heads * key_len * dtype_size)
-    max_chunk = max_mem_bytes // (batch_size * num_heads * key_len * dtype_size)
-    
-    # Clamp to at least 1 and at most seq_len
+
+    # Let x = chunk_size
+    # Total memory per chunk (in bytes):
+    #   2 * [batch, heads, x, key_len] (scores + softmax)
+    # + 1 * [batch, heads, x, head_dim] (output)
+    # = 2 * batch_size * num_heads * x * key_len * dtype_size
+    #   + batch_size * num_heads * x * head_dim * dtype_size
+    # = batch_size * num_heads * x * (2 * key_len + head_dim) * dtype_size
+
+    denom = batch_size * num_heads * (2 * key_len + head_dim) * dtype_size
+    if denom == 0:
+        return 1
+
+    max_chunk = max_mem_bytes // denom
+
     chunk_size = max(1, min(seq_len, int(max_chunk)))
-    
-    # Align down to the nearest multiple of 8 for potential performance benefit
     aligned_chunk_size = (chunk_size // 8) * 8
-    
-    # Ensure the aligned size is at least 1 (or maybe 8?)
     return max(1, aligned_chunk_size)
 
 @dataclass
