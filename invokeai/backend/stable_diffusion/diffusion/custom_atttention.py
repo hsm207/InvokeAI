@@ -259,9 +259,9 @@ class CustomAttnProcessor2_0(AttnProcessor2_0):
             "attention_mask": attention_mask.detach().cpu() if attention_mask is not None else None
         }
     
-        os.makedirs(os.path.join(os.getcwd(), 'tests'), exist_ok=True)
-        torch.save(tensors, os.path.join(os.getcwd(), 'tests', 'problematic_tensors.pt'))
-        logger.debug(f"Saved tensors to {os.path.join(os.getcwd(), 'tests', 'problematic_tensors.pt')}")
+        # os.makedirs(os.path.join(os.getcwd(), 'tests'), exist_ok=True)
+        # torch.save(tensors, os.path.join(os.getcwd(), 'tests', 'problematic_tensors.pt'))
+        # logger.debug(f"Saved tensors to {os.path.join(os.getcwd(), 'tests', 'problematic_tensors.pt')}")
         
         # ---------------------
         # the output of sdp = (batch, num_heads, seq_len, head_dim)
